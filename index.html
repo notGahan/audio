@@ -1,0 +1,572 @@
+<!-- index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Minimal Audio Visualizer</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background: #000;
+        }
+        canvas {
+            display: block;
+        }
+        #startButton {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            padding: 15px 30px;
+            font-size: 18px;
+            background: #333;
+            color: #fff;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            z-index: 1000;
+        }
+        #startButton:hover {
+            background: #444;
+        }
+    </style>
+</head>
+<body>
+    <button id="startButton">Start Visualization</button>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/simplex-noise/2.4.0/simplex-noise.min.js"></script>
+    <script>
+        let scene, camera, renderer, analyser, dataArray;
+        let particles = [];
+        let isDragging = false;
+        let previousMousePosition = { x: 0, y: 0 };
+        let sphereRotation = { x: 0, y: 0 };
+        let rotationVelocity = { x: 0, y: 0 };
+        let currentDistortion = 0;
+        let currentNoise = 0;
+        const simplex = new SimplexNoise();
+        const PARTICLE_COUNT = 12000;
+        const DAMPING = 0.95;
+        const ROTATION_SPEED = 0.005;
+        const SMOOTHING_FACTOR = 0.15;
+        let spreadParticles;
+        const SPREAD_PARTICLE_COUNT = 2000;
+        let spreadPositions;
+        let spreadVelocities;
+        let spreadLifetimes;
+        let starfield;
+        const STAR_COUNT = 4000;
+        const STAR_SPEED = {
+            DEFAULT: 0.015,
+            MAX: 0.04,     // Maximum speed when audio is at peak
+            MIN: 0.01      // Minimum speed when audio is below threshold
+        };
+        const STAR_SPREAD = 25;
+        
+        const FREQ_BANDS = {
+            BASS: { start: 0, end: 4 },    // ~20-60Hz
+            LOW_MID: { start: 4, end: 10 }, // ~60-250Hz
+            MID: { start: 10, end: 20 },    // ~250-500Hz
+            HIGH: { start: 20, end: 30 }    // ~500-1000Hz
+        };
+        
+        const AUDIO_THRESHOLD = 0.30; // Adjust this value between 0 and 1 to change sensitivity
+        const MIN_AUDIO_LEVEL = 0.02; // Minimum level to consider as non-silence
+        
+        const WAVE_SPEED = 0.8;
+        const PULSE_INTENSITY = 0.4;
+        const TWIST_FACTOR = 0.6;
+        
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            renderer = new THREE.WebGLRenderer({ 
+                antialias: true,
+                alpha: true 
+            });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setClearColor(0x000000, 1);
+            document.body.appendChild(renderer.domElement);
+            
+            createSphereParticles();
+            createSpreadParticles();
+            createStarfield();
+            camera.position.z = 2;
+            
+            document.addEventListener('mousedown', onMouseDown);
+            document.addEventListener('mousemove', onMouseMove);
+            document.addEventListener('mouseup', onMouseUp);
+        }
+        
+        function createSphereParticles() {
+            const radius = 0.8;
+            const geometry = new THREE.BufferGeometry();
+            const positions = [];
+            const basePositions = [];
+            
+            // Generate points on a sphere using spherical coordinates
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                // Fibonacci sphere distribution
+                const phi = Math.acos(1 - 2 * (i / PARTICLE_COUNT));
+                const theta = Math.PI * (1 + Math.sqrt(5)) * i;
+                
+                const x = radius * Math.sin(phi) * Math.cos(theta);
+                const y = radius * Math.sin(phi) * Math.sin(theta);
+                const z = radius * Math.cos(phi);
+                
+                positions.push(x, y, z);
+                basePositions.push(x, y, z);
+            }
+            
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            
+            const material = new THREE.PointsMaterial({
+                color: 0xffffff,
+                size: 0.004,
+                transparent: true,
+                opacity: 0.6,
+                blending: THREE.AdditiveBlending
+            });
+            
+            const particleSystem = new THREE.Points(geometry, material);
+            particleSystem.userData.basePositions = basePositions;
+            scene.add(particleSystem);
+            particles.push(particleSystem);
+        }
+        
+        function createSpreadParticles() {
+            const geometry = new THREE.BufferGeometry();
+            spreadPositions = new Float32Array(SPREAD_PARTICLE_COUNT * 3);
+            spreadVelocities = new Float32Array(SPREAD_PARTICLE_COUNT * 3);
+            spreadLifetimes = new Float32Array(SPREAD_PARTICLE_COUNT);
+            
+            // Initialize all particles at the center with zero velocity and zero lifetime
+            for (let i = 0; i < SPREAD_PARTICLE_COUNT; i++) {
+                spreadLifetimes[i] = 0;
+            }
+            
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(spreadPositions, 3));
+            geometry.setAttribute('lifetime', new THREE.Float32BufferAttribute(spreadLifetimes, 1));
+            
+            // Custom shader material for better-looking particles
+            const material = new THREE.ShaderMaterial({
+                uniforms: {
+                    color: { value: new THREE.Color(0x88ccff) }
+                },
+                vertexShader: `
+                    attribute float lifetime;
+                    varying float vLifetime;
+                    
+                    void main() {
+                        vLifetime = lifetime;
+                        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                        gl_Position = projectionMatrix * mvPosition;
+                        gl_PointSize = 3.0 * (1.0 - distance(position, vec3(0.0)) / 2.0) * lifetime;
+                    }
+                `,
+                fragmentShader: `
+                    uniform vec3 color;
+                    varying float vLifetime;
+                    
+                    void main() {
+                        float dist = length(gl_PointCoord - vec2(0.5));
+                        if (dist > 0.5) discard;
+                        
+                        float opacity = vLifetime * (1.0 - dist * 2.0);
+                        gl_FragColor = vec4(color, opacity);
+                    }
+                `,
+                transparent: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+            });
+            
+            spreadParticles = new THREE.Points(geometry, material);
+            scene.add(spreadParticles);
+        }
+        
+        function createStarfield() {
+            const geometry = new THREE.BufferGeometry();
+            const positions = new Float32Array(STAR_COUNT * 3);
+            const starSizes = new Float32Array(STAR_COUNT);
+            
+            // Create stars in a large cylindrical volume
+            for (let i = 0; i < STAR_COUNT; i++) {
+                // Random angle around Y axis
+                const theta = Math.random() * Math.PI * 2;
+                
+                // Modified radius distribution to create clearer center
+                // Use exponential distribution to push stars towards the edges
+                const r = STAR_SPREAD * Math.pow(Math.random(), 0.5);
+                
+                // Skip stars that are too close to the center
+                if (r < STAR_SPREAD * 0.15) {
+                    // Regenerate this star position
+                    i--;
+                    continue;
+                }
+                
+                // Random position along Z axis
+                const z = (Math.random() * 2 - 1) * STAR_SPREAD;
+                
+                positions[i * 3] = Math.cos(theta) * r;     // x
+                positions[i * 3 + 1] = Math.sin(theta) * r; // y
+                positions[i * 3 + 2] = z;                   // z
+                
+                // Smaller star sizes with slight variation
+                starSizes[i] = Math.random() * 0.3 + 0.2;
+            }
+            
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            geometry.setAttribute('size', new THREE.Float32BufferAttribute(starSizes, 1));
+            
+            const material = new THREE.ShaderMaterial({
+                uniforms: {
+                    color: { value: new THREE.Color(0xffffff) },
+                    time: { value: 0 },
+                    speed: { value: 0 }
+                },
+                vertexShader: `
+                    attribute float size;
+                    varying float vAlpha;
+                    varying float vSpeed;
+                    uniform float time;
+                    uniform float speed;
+                    
+                    void main() {
+                        vec3 pos = position;
+                        pos.z = mod(pos.z + time, ${STAR_SPREAD.toFixed(1)}) - ${(STAR_SPREAD/2).toFixed(1)};
+                        
+                        float depth = (${STAR_SPREAD.toFixed(1)} + pos.z) / ${STAR_SPREAD.toFixed(1)};
+                        vAlpha = smoothstep(0.0, 0.3, depth) * (1.0 - smoothstep(0.7, 1.0, depth));
+                        
+                        vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+                        gl_Position = projectionMatrix * mvPosition;
+                        
+                        vSpeed = speed;
+                        
+                        float speedFactor = 1.0 + speed * 2.0;
+                        gl_PointSize = size * (80.0 / -mvPosition.z) * vAlpha * speedFactor;
+                    }
+                `,
+                fragmentShader: `
+                    uniform vec3 color;
+                    varying float vAlpha;
+                    varying float vSpeed;
+                    
+                    void main() {
+                        vec2 pc = gl_PointCoord * 2.0 - 1.0;
+                        
+                        float stretch = 1.0 + vSpeed * 3.0;
+                        vec2 stretched = vec2(pc.x * stretch, pc.y);
+                        float dist = length(vec2(stretched.x / stretch, stretched.y));
+                        
+                        float streak = smoothstep(1.0, 0.0, abs(stretched.x));
+                        float falloff = smoothstep(1.0, 0.0, dist);
+                        
+                        float brightness = mix(falloff, streak * falloff, smoothstep(0.0, 0.5, vSpeed));
+                        
+                        if (dist > 1.0 && brightness < 0.1) discard;
+                        
+                        float alpha = brightness * vAlpha * 0.8;
+                        gl_FragColor = vec4(color, alpha);
+                    }
+                `,
+                transparent: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+            });
+            
+            starfield = new THREE.Points(geometry, material);
+            scene.add(starfield);
+        }
+        
+        function onMouseDown(event) {
+            isDragging = true;
+            previousMousePosition = {
+                x: event.clientX,
+                y: event.clientY
+            };
+        }
+        
+        function onMouseMove(event) {
+            if (!isDragging) return;
+            
+            const deltaMove = {
+                x: event.clientX - previousMousePosition.x,
+                y: event.clientY - previousMousePosition.y
+            };
+            
+            rotationVelocity.x += deltaMove.y * ROTATION_SPEED;
+            rotationVelocity.y += deltaMove.x * ROTATION_SPEED;
+            
+            // Limit velocity
+            rotationVelocity.x = Math.max(-0.2, Math.min(0.2, rotationVelocity.x));
+            rotationVelocity.y = Math.max(-0.2, Math.min(0.2, rotationVelocity.y));
+            
+            previousMousePosition = {
+                x: event.clientX,
+                y: event.clientY
+            };
+        }
+        
+        function onMouseUp() {
+            isDragging = false;
+        }
+        
+        function updateRotation() {
+            // Apply damping
+            rotationVelocity.x *= DAMPING;
+            rotationVelocity.y *= DAMPING;
+            
+            // Update position
+            sphereRotation.x += rotationVelocity.x;
+            sphereRotation.y += rotationVelocity.y;
+            
+            // Keep rotation within bounds
+            sphereRotation.x = Math.max(-Math.PI/2, Math.min(Math.PI/2, sphereRotation.x));
+        }
+        
+        function updateSpreadParticles(bassValue) {
+            const positions = spreadParticles.geometry.attributes.position.array;
+            const lifetimes = spreadParticles.geometry.attributes.lifetime.array;
+            
+            // Update existing particles
+            for (let i = 0; i < SPREAD_PARTICLE_COUNT; i++) {
+                if (spreadLifetimes[i] > 0) {
+                    // Update position based on velocity
+                    positions[i * 3] += spreadVelocities[i * 3];
+                    positions[i * 3 + 1] += spreadVelocities[i * 3 + 1];
+                    positions[i * 3 + 2] += spreadVelocities[i * 3 + 2];
+                    
+                    // Decrease lifetime
+                    spreadLifetimes[i] -= 0.016;
+                    lifetimes[i] = spreadLifetimes[i];
+                }
+            }
+            
+            // Emit new particles based on bass
+            if (bassValue > 0.5) {
+                const particlesToEmit = Math.floor(bassValue * 20);
+                let emitted = 0;
+                
+                for (let i = 0; i < SPREAD_PARTICLE_COUNT && emitted < particlesToEmit; i++) {
+                    if (spreadLifetimes[i] <= 0) {
+                        // Generate random point on sphere surface
+                        const phi = Math.random() * Math.PI * 2;
+                        const theta = Math.random() * Math.PI;
+                        const radius = 0.8;
+                        
+                        positions[i * 3] = radius * Math.sin(theta) * Math.cos(phi);
+                        positions[i * 3 + 1] = radius * Math.sin(theta) * Math.sin(phi);
+                        positions[i * 3 + 2] = radius * Math.cos(theta);
+                        
+                        // Set velocity outward from sphere
+                        const speed = 0.01 * (0.5 + bassValue);
+                        spreadVelocities[i * 3] = positions[i * 3] / radius * speed;
+                        spreadVelocities[i * 3 + 1] = positions[i * 3 + 1] / radius * speed;
+                        spreadVelocities[i * 3 + 2] = positions[i * 3 + 2] / radius * speed;
+                        
+                        // Set lifetime
+                        spreadLifetimes[i] = 1.0;
+                        lifetimes[i] = 1.0;
+                        
+                        emitted++;
+                    }
+                }
+            }
+            
+            spreadParticles.geometry.attributes.position.needsUpdate = true;
+            spreadParticles.geometry.attributes.lifetime.needsUpdate = true;
+        }
+        
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            analyser.getByteFrequencyData(dataArray);
+            
+            // Calculate average values for each frequency band
+            const getAverageFrequency = (start, end) => {
+                let sum = 0;
+                for (let i = start; i < end; i++) {
+                    sum += dataArray[i];
+                }
+                return (sum / (end - start)) / 255;
+            };
+            
+            const frequencies = {
+                bass: getAverageFrequency(FREQ_BANDS.BASS.start, FREQ_BANDS.BASS.end) * 1.5,
+                lowMid: getAverageFrequency(FREQ_BANDS.LOW_MID.start, FREQ_BANDS.LOW_MID.end) * 1.2,
+                mid: getAverageFrequency(FREQ_BANDS.MID.start, FREQ_BANDS.MID.end),
+                high: getAverageFrequency(FREQ_BANDS.HIGH.start, FREQ_BANDS.HIGH.end) * 0.8
+            };
+            
+            // Calculate overall audio level
+            const overallLevel = (frequencies.bass + frequencies.lowMid + frequencies.mid + frequencies.high) / 4;
+            
+            // If audio is below threshold, reset the sphere to its original shape
+            if (overallLevel < AUDIO_THRESHOLD) {
+                const positions = particles[0].geometry.attributes.position.array;
+                const basePositions = particles[0].userData.basePositions;
+                
+                // Smoothly return to sphere shape
+                for (let i = 0; i < positions.length; i += 3) {
+                    positions[i] = basePositions[i];
+                    positions[i + 1] = basePositions[i + 1];
+                    positions[i + 2] = basePositions[i + 2];
+                }
+                
+                particles[0].geometry.attributes.position.needsUpdate = true;
+                currentNoise = 0;
+                currentDistortion = 0;
+            } else {
+                const time = Date.now() * 0.0003;
+                
+                updateRotation();
+                
+                const positions = particles[0].geometry.attributes.position.array;
+                const basePositions = particles[0].userData.basePositions;
+                
+                // Scale the frequencies based on how far they are above the threshold
+                const scale = (overallLevel - AUDIO_THRESHOLD) / (1 - AUDIO_THRESHOLD);
+                const scaledFrequencies = {
+                    bass: frequencies.bass * scale,
+                    lowMid: frequencies.lowMid * scale,
+                    mid: frequencies.mid * scale,
+                    high: frequencies.high * scale
+                };
+                
+                // Enhanced frequency-based effects
+                const targetNoise = (scaledFrequencies.mid * 0.5) + (scaledFrequencies.high * 0.3);
+                const targetDistortion = (scaledFrequencies.bass * 0.7) + (scaledFrequencies.lowMid * 0.3);
+                const pulseEffect = Math.sin(time * WAVE_SPEED) * scaledFrequencies.bass * PULSE_INTENSITY;
+                
+                currentNoise += (targetNoise - currentNoise) * SMOOTHING_FACTOR;
+                currentDistortion += (targetDistortion - currentDistortion) * SMOOTHING_FACTOR;
+                
+                for (let i = 0; i < positions.length; i += 3) {
+                    const baseX = basePositions[i];
+                    const baseY = basePositions[i + 1];
+                    const baseZ = basePositions[i + 2];
+                    
+                    // Calculate angle for twist effect
+                    const angle = Math.atan2(baseY, baseX);
+                    const radius = Math.sqrt(baseX * baseX + baseY * baseY);
+                    const heightFactor = baseZ * scaledFrequencies.mid * TWIST_FACTOR;
+                    
+                    // Create more dynamic noise patterns
+                    const noiseX = simplex.noise4D(
+                        baseX * 2,
+                        baseY * 2,
+                        baseZ * 2,
+                        time * 1.2
+                    ) * currentNoise;
+                    
+                    const noiseY = simplex.noise4D(
+                        baseX * 2,
+                        baseY * 2,
+                        baseZ * 2,
+                        time * 1.2 + 100
+                    ) * currentNoise;
+                    
+                    const noiseZ = simplex.noise4D(
+                        baseX * 2,
+                        baseY * 2,
+                        baseZ * 2,
+                        time * 1.2 + 200
+                    ) * currentNoise;
+                    
+                    // Combine multiple effects
+                    const twistX = Math.cos(angle + heightFactor) * radius;
+                    const twistY = Math.sin(angle + heightFactor) * radius;
+                    
+                    const pulseRadius = 1.0 + pulseEffect * (1 - Math.abs(baseZ));
+                    
+                    // Apply frequency-based distortions with enhanced effects
+                    const distortionX = currentDistortion * (1 + scaledFrequencies.mid * 0.5);
+                    const distortionY = currentDistortion * (1 + scaledFrequencies.lowMid * 0.5);
+                    const distortionZ = currentDistortion * (1 + scaledFrequencies.high * 0.3);
+                    
+                    // Combine all effects
+                    const finalX = baseX * pulseRadius + noiseX * distortionX + (twistX - baseX) * scaledFrequencies.mid;
+                    const finalY = baseY * pulseRadius + noiseY * distortionY + (twistY - baseY) * scaledFrequencies.mid;
+                    const finalZ = baseZ + noiseZ * distortionZ + Math.sin(radius * 5 + time * 3) * scaledFrequencies.high * 0.1;
+                    
+                    positions[i] = finalX;
+                    positions[i + 1] = finalY;
+                    positions[i + 2] = finalZ;
+                }
+                
+                particles[0].geometry.attributes.position.needsUpdate = true;
+            }
+            
+            particles[0].rotation.x = sphereRotation.x;
+            particles[0].rotation.y = sphereRotation.y;
+            
+            // Only update spread particles if audio is above threshold
+            if (overallLevel > AUDIO_THRESHOLD) {
+                updateSpreadParticles(frequencies.bass * ((overallLevel - AUDIO_THRESHOLD) / (1 - AUDIO_THRESHOLD)));
+            }
+            
+            // Update starfield speed based on audio level
+            let targetStarSpeed;
+            if (overallLevel < AUDIO_THRESHOLD) {
+                // Below threshold - gradually return to default speed
+                targetStarSpeed = STAR_SPEED.DEFAULT;
+            } else {
+                // Above threshold - speed up based on audio intensity
+                const audioIntensity = (overallLevel - AUDIO_THRESHOLD) / (1 - AUDIO_THRESHOLD);
+                targetStarSpeed = STAR_SPEED.DEFAULT + (STAR_SPEED.MAX - STAR_SPEED.DEFAULT) * audioIntensity;
+            }
+            
+            // Smoothly transition the speed
+            const currentSpeed = starfield.material.uniforms.time.value % STAR_SPEED.MAX;
+            const newSpeed = currentSpeed + (targetStarSpeed - STAR_SPEED.DEFAULT) * 0.3;
+            const finalSpeed = Math.max(STAR_SPEED.MIN, Math.min(STAR_SPEED.MAX, newSpeed));
+            starfield.material.uniforms.time.value += finalSpeed;
+            
+            // Update speed uniform for streak effect
+            const normalizedSpeed = (finalSpeed - STAR_SPEED.MIN) / (STAR_SPEED.MAX - STAR_SPEED.MIN);
+            starfield.material.uniforms.speed.value = normalizedSpeed;
+            
+            renderer.render(scene, camera);
+        }
+        
+        async function setupAudio() {
+            const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            analyser = audioContext.createAnalyser();
+            analyser.fftSize = 512;
+            analyser.smoothingTimeConstant = 0.88;
+            dataArray = new Uint8Array(analyser.frequencyBinCount);
+            
+            try {
+                const audio = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        echoCancellation: false,
+                        noiseSuppression: false,
+                        autoGainControl: false
+                    } 
+                });
+                const source = audioContext.createMediaStreamSource(audio);
+                source.connect(analyser);
+                document.getElementById('startButton').style.display = 'none';
+                animate();
+            } catch (error) {
+                console.error('Error accessing microphone:', error);
+            }
+        }
+        
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+        
+        init();
+        window.addEventListener('resize', onWindowResize);
+        document.getElementById('startButton').addEventListener('click', setupAudio);
+    </script>
+</body>
+</html>
